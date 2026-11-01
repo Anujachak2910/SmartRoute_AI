@@ -307,11 +307,47 @@ def calculate_route(req: RouteRequest):
             logging.error(f"OSRM Error: {e}")
             raise HTTPException(status_code=500, detail=f"Long-distance routing failed: {e}")
     
-    try:
-        # 2. Auto-detect traffic level based on time & location
-        traffic_info = predict_traffic_level(req.source, req.destination)
-        logging.info(f"AI Traffic Detection: {traffic_info}")
+    # 2. Auto-detect traffic level based on time & location
+    traffic_info = predict_traffic_level(req.source, req.destination)
+    logging.info(f"AI Traffic Detection: {traffic_info}")
 
+    # Helper function for OSRM fallback
+    def fallback_to_osrm(reason_msg: str):
+        logging.warning(f"{reason_msg}. Falling back to OSRM engine.")
+        osrm_url = f"http://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}?overview=full&geometries=geojson"
+        resp = requests.get(osrm_url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("routes") or len(data["routes"]) == 0:
+            raise HTTPException(status_code=404, detail="No route found between the specified locations.")
+        route_obj = data["routes"][0]
+        coordinates = route_obj["geometry"]["coordinates"]
+        path_coords = [{"lat": pt[1], "lon": pt[0]} for pt in coordinates]
+        base_duration_min = route_obj["duration"] / 60
+        dist_km = round(route_obj["distance"] / 1000, 2)
+        traffic_multiplier = 1.0 + (traffic_info["level"] * 0.4)
+        adjusted_duration_min = round(base_duration_min * traffic_multiplier, 2)
+        pumps = []
+        if req.fetch_pois:
+            try:
+                pumps = fetch_pumps_along_route(path_coords, max_results=15)
+            except Exception:
+                pumps = []
+        return {
+            "source_coords": {"lat": lat1, "lon": lon1},
+            "dest_coords": {"lat": lat2, "lon": lon2},
+            "route": path_coords,
+            "metrics": {
+                "time_minutes": adjusted_duration_min,
+                "distance_km": dist_km,
+                "algorithm": "OSRM (Fast Fallback Routing)"
+            },
+            "traffic": traffic_info,
+            "pois": pumps
+        }
+
+    # Attempt local A* pathfinding first
+    try:
         # 3. Fetch Map Graph
         G = fetch_map_data(lat1, lon1, lat2, lon2)
         
@@ -326,13 +362,16 @@ def calculate_route(req: RouteRequest):
         result = find_optimal_path(G, source_node, dest_node)
         
         if not result:
-            raise HTTPException(status_code=404, detail="No path found between the locations.")
+            return fallback_to_osrm("No connected path found in local street graph")
             
-        # 5. Get POIs along the route
+        # 7. Get POIs along the route
         pumps = []
         path_coords = [{"lat": n['y'], "lon": n['x']} for n in result["path"]]
         if req.fetch_pois:
-            pumps = fetch_pumps_along_route(path_coords, max_results=15)
+            try:
+                pumps = fetch_pumps_along_route(path_coords, max_results=15)
+            except Exception:
+                pumps = []
 
         return {
             "source_coords": {"lat": lat1, "lon": lon1},
@@ -347,8 +386,12 @@ def calculate_route(req: RouteRequest):
             "pois": pumps
         }
     except Exception as e:
-        logging.error(f"Routing Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Local pathfinding failed: {e}")
+        logging.warning(f"Local A* routing failed ({e}), falling back to OSRM")
+        try:
+            return fallback_to_osrm(f"Local routing exception: {e}")
+        except Exception as osrm_err:
+            logging.error(f"Routing Error: {osrm_err}")
+            raise HTTPException(status_code=500, detail=f"Routing failed: {osrm_err}")
 
 # Mount static files for the frontend UI
 frontend_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "frontend")
